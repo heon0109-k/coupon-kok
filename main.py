@@ -38,11 +38,17 @@ app.add_middleware(
 db = firestore.Client(project=GCP_PROJECT, database=os.environ.get("FIRESTORE_DATABASE", "(default)"))
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-RECOMMEND_PROMPT = """역할: 당신은 계산된 혜택 목록을 사용자에게 친절하게 설명하는 어시스턴트입니다.
-목적: 아래 JSON은 이미 계산이 끝난, 사용자가 지금 이 매장에서 아직 사용하지 않은 혜택 목록입니다. 이 중 할인액이 가장 큰 것을 추천하고, 왜 그것이 더 유리한지 한 문장으로 설명하세요.
+RECOMMEND_PROMPT = """역할: 당신은 계산된 혜택·쿠폰 정보를 사용자에게 친절하게 설명하는 어시스턴트입니다.
+목적: 아래 JSON은 이미 계산이 끝난 정보입니다.
+- best_benefit_candidates: 할인액(discount_value) 기준 이미 정렬된, 아직 안 쓴 "혜택(자격)" 목록. 이 중 discount_value가 가장 큰 것을 추천 대상으로 삼으세요.
+- owned_coupon_count: 아직 안 쓴 "보유 쿠폰(기프티콘 등)"의 개수.
+규칙:
+- 혜택은 할인율/할인액으로 서로 비교해서 가장 유리한 하나를 추천하세요.
+- 쿠폰은 혜택과 금액으로 직접 비교하지 마세요. 대신 "보유하신 쿠폰이 N장 있습니다" 형태로 별도 안내만 하세요 (쿠폰은 이미 사용자 소유물이라 언제 쓸지는 사용자가 정합니다).
+- best_benefit_candidates가 비어있으면 혜택 추천 문장은 생략하고 쿠폰 안내만 하세요. owned_coupon_count가 0이면 쿠폰 문장은 생략하세요.
+- 목록에 없는 혜택이나 수치를 새로 만들어내지 마세요.
 입력: {data}
-규칙: 목록에 없는 혜택이나 수치를 새로 만들어내지 마세요. 계산은 이미 끝난 상태이며, 당신의 역할은 요약·설명뿐입니다.
-출력: 자연어 문장 1~2개만 출력하세요."""
+출력: 자연어 문장 1~3개만 출력하세요."""
 
 
 class MatchRequest(BaseModel):
@@ -205,12 +211,14 @@ def is_within_valid_period(valid_from, valid_to) -> bool:
 
 
 def rule_engine(eligible_benefits: list, owned_coupons: list):
-    """적용가능·중복가능·할인액 계산 + 사용 여부(used)·유효기간에 따라 후보군 분리 (코드 기반)"""
-    candidates = []
+    """적용가능·중복가능·유효기간을 계산해 후보군을 분리 (코드 기반).
+    혜택(정률/정액 할인)과 쿠폰(보유 자산, 특히 FREE_ITEM)은 가치를 같은 잣대로 비교할 수 없으므로
+    분리해서 반환한다 — 혜택끼리는 할인액으로 비교, 쿠폰은 개수로 안내한다."""
+    benefit_candidates = []
     for b in eligible_benefits:
         if not is_within_valid_period(b.get("valid_from"), b.get("valid_to")):
-            continue
-        candidates.append({
+            continue  # 유효기간이 지났거나 아직 시작 안 한 혜택은 후보에서 제외
+        benefit_candidates.append({
             "source": "benefit",
             "key": b["benefit_key"],
             "provider": b.get("provider"),
@@ -218,10 +226,13 @@ def rule_engine(eligible_benefits: list, owned_coupons: list):
             "discount_value": b.get("discount_value"),
             "used": b.get("used", False),
         })
+    benefit_candidates.sort(key=lambda x: x.get("discount_value") or 0, reverse=True)
+
+    coupon_candidates = []
     for c in owned_coupons:
         if not is_within_valid_period(None, c.get("expires_at")):
-            continue
-        candidates.append({
+            continue  # 유효기한이 지난 쿠폰은 후보에서 제외
+        coupon_candidates.append({
             "source": "coupon",
             "key": c["coupon_id"],
             "provider": c.get("provider", "OWNED_COUPON"),
@@ -229,15 +240,22 @@ def rule_engine(eligible_benefits: list, owned_coupons: list):
             "discount_value": c.get("discount_value"),
             "used": c.get("used", False),
         })
-    candidates.sort(key=lambda x: x.get("discount_value") or 0, reverse=True)
-    return candidates
+
+    return benefit_candidates, coupon_candidates
 
 
-def generate_recommendation(not_used_candidates: list) -> str:
-    """Gemini가 '아직 안 쓴' 혜택 중에서만 결과를 자연어로 요약 (RAG 아님)"""
-    if not not_used_candidates:
+def generate_recommendation(not_used_benefits: list, not_used_coupons: list) -> str:
+    """Gemini가 '아직 안 쓴' 혜택과 쿠폰을 각각 다른 방식으로 안내 (RAG 아님).
+    혜택은 그중 가장 할인액이 큰 것을 추천하고, 쿠폰은 몇 장 보유 중인지만 안내한다."""
+    if not not_used_benefits and not not_used_coupons:
         return "이미 이 매장의 혜택을 모두 사용하셨어요. 다음 기회에 다시 안내해드릴게요."
-    prompt = RECOMMEND_PROMPT.format(data=not_used_candidates)
+
+    data = {
+        "best_benefit_candidates": not_used_benefits,  # 할인액 기준 이미 정렬된 상태
+        "owned_coupon_count": len(not_used_coupons),
+        "owned_coupons": not_used_coupons,
+    }
+    prompt = RECOMMEND_PROMPT.format(data=data)
     response = genai_client.models.generate_content(
         model="gemini-3.5-flash-lite",
         contents=prompt,
@@ -260,6 +278,93 @@ def mark_notified_today(user_id: str, store_id: str):
     })
 
 
+BRAND_ALIASES = {
+    "STARBUCKS": ["스타벅스", "스벅", "starbucks", "starbuck"],
+    "PARIS_BAGUETTE": ["파리바게뜨", "파리바게트", "파바", "paris baguette", "parisbaguette"],
+}
+
+
+CHAT_ANSWER_PROMPT = """역할: 당신은 '쿠폰콕' 앱의 혜택 상담 어시스턴트입니다.
+목적: 사용자의 질문에 대해, 아래 JSON으로 제공된 실제 조회 결과만 근거로 답하세요.
+규칙:
+- 목록에 없는 혜택, 쿠폰, 금액, 조건은 새로 만들지 마세요.
+- best_benefit_candidates가 있으면 가장 위의 혜택을 먼저 추천하세요.
+- owned_coupon_count가 1 이상이면 보유 쿠폰 개수를 별도로 알려주세요.
+- 사용 완료된 항목은 추천하지 말고, 이미 사용했다고만 설명하세요.
+- 친근하고 간결한 한국어 1~3문장으로 답하세요.
+
+사용자 질문: {message}
+조회 결과 JSON: {data}
+"""
+
+
+class ChatRequest(BaseModel):
+    user_id: str
+    message: str
+
+
+def extract_brand_from_message(message: str) -> str | None:
+    normalized = message.lower().replace(" ", "")
+    for brand, aliases in BRAND_ALIASES.items():
+        for alias in aliases:
+            if alias.lower().replace(" ", "") in normalized:
+                return brand
+    return None
+
+
+def generate_chat_answer(message: str, brand: str, not_used_benefits: list, not_used_coupons: list, used_benefits: list, used_coupons: list) -> str:
+    data = {
+        "brand": brand,
+        "best_benefit_candidates": not_used_benefits,
+        "owned_coupon_count": len(not_used_coupons),
+        "owned_coupons": not_used_coupons,
+        "used_benefits": used_benefits,
+        "used_coupons": used_coupons,
+    }
+    prompt = CHAT_ANSWER_PROMPT.format(
+        message=message,
+        data=json.dumps(data, ensure_ascii=False, default=str),
+    )
+    response = genai_client.models.generate_content(
+        model="gemini-3.5-flash-lite",
+        contents=prompt,
+    )
+    return response.text.strip()
+
+
+@app.post("/api/chat")
+def chat(req: ChatRequest):
+    """서버가 직접 Firestore를 조회하고, Gemini는 조회 결과를 자연어로 설명한다."""
+    brand = extract_brand_from_message(req.message)
+    if not brand:
+        return {
+            "reply": "어느 매장인지 확인이 안 돼요. 예를 들어 '스타벅스'나 '파리바게뜨'처럼 매장 이름을 넣어 물어봐 주세요."
+        }
+
+    eligible_benefits = get_eligible_benefits(req.user_id, brand)
+    owned_coupons = get_owned_coupons(req.user_id, brand)
+    attach_usage_flags(req.user_id, eligible_benefits, owned_coupons)
+
+    benefit_candidates, coupon_candidates = rule_engine(eligible_benefits, owned_coupons)
+    not_used_benefits = [c for c in benefit_candidates if not c["used"]]
+    not_used_coupons = [c for c in coupon_candidates if not c["used"]]
+    used_benefits = [c for c in benefit_candidates if c["used"]]
+    used_coupons = [c for c in coupon_candidates if c["used"]]
+
+    if not not_used_benefits and not not_used_coupons:
+        return {"reply": "지금 이 매장에서 새로 쓸 수 있는 혜택이나 보유 쿠폰은 확인되지 않아요."}
+
+    reply = generate_chat_answer(
+        req.message,
+        brand,
+        not_used_benefits,
+        not_used_coupons,
+        used_benefits,
+        used_coupons,
+    )
+    return {"reply": reply}
+
+
 @app.post("/api/match")
 def match(req: MatchRequest):
     store_doc = db.collection("stores").document(req.store_id).get()
@@ -271,12 +376,13 @@ def match(req: MatchRequest):
     owned_coupons = get_owned_coupons(req.user_id, brand)
     attach_usage_flags(req.user_id, eligible_benefits, owned_coupons)
 
-    candidates = rule_engine(eligible_benefits, owned_coupons)
-    not_used = [c for c in candidates if not c["used"]]
-    recommendation = generate_recommendation(not_used)
+    benefit_candidates, coupon_candidates = rule_engine(eligible_benefits, owned_coupons)
+    not_used_benefits = [c for c in benefit_candidates if not c["used"]]
+    not_used_coupons = [c for c in coupon_candidates if not c["used"]]
+    recommendation = generate_recommendation(not_used_benefits, not_used_coupons)
 
     # auto(자동 위치 트리거)일 때만 하루 1회 알림 제한을 적용. manual(수동 확인)은 항상 전체 정보 표시.
-    should_notify = len(not_used) > 0
+    should_notify = len(not_used_benefits) > 0 or len(not_used_coupons) > 0
     if req.trigger_type == "auto":
         if was_notified_today(req.user_id, req.store_id):
             should_notify = False
